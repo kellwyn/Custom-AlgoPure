@@ -21,6 +21,8 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
+os.makedirs("logs", exist_ok=True)   # must exist before FileHandler opens it
+
 logging.basicConfig(
     level   = logging.INFO,
     format  = "%(asctime)s [%(levelname)s] %(message)s",

@@ -1,10 +1,18 @@
 """
 Command executor — maps ParsedCommand → MT5 actions.
-Handles confirmation display, SL/TP resolution, and dispatch.
+
+Speed design:
+  - One _cached_sym_info() lookup per order shared across all helpers.
+  - Signal lab snapshot fires in a daemon thread immediately after order_send
+    so market context prints without blocking the next command.
 """
 from __future__ import annotations
 
 import logging
+import os
+import sys
+import threading
+from pathlib import Path
 from typing import Optional
 
 import MetaTrader5 as mt5
@@ -12,23 +20,45 @@ import MetaTrader5 as mt5
 from .commands      import ParsedCommand
 from .config        import ExecutionConfig
 from .order_manager import OrderManager
-from .risk          import (
-    sl_to_price, tp_to_price, price_to_pnl,
-    risk_based_lots, kelly_lots,
-)
+from .risk          import sl_to_price, tp_to_price, risk_based_lots, kelly_lots
 from .signals       import TradeOrder
 from .trader        import (
-    get_symbol_info, get_tick, get_account,
+    _cached_sym_info, get_tick, get_account,
     get_open_positions, get_pending_orders,
     send_market_order, send_limit_order, send_stop_order,
     modify_position, modify_pending_order,
     close_position, close_all_positions, cancel_pending_order,
-    pip_value_per_lot,
+    pip_value_per_lot, warm_symbol,
 )
 
-log = logging.getLogger("algopure-bot")
-
+log  = logging.getLogger("algopure-bot")
 _SEP = "─" * 64
+
+# Path to signal lab (two dirs up from this file)
+_LAB_DIR = Path(__file__).parent.parent.parent / "algopure-signal-lab"
+
+
+# ── Parallel signal lab snapshot ──────────────────────────────────────────────
+
+def _fire_signal_lab(symbol: str) -> None:
+    """
+    Launch fast_snapshot in a daemon thread immediately after order execution.
+    Uses the existing MT5 connection — no re-init overhead.
+    Output prints to the same terminal after a brief pause so it doesn't
+    interleave with the order confirmation line.
+    """
+    def _run():
+        import time, importlib.util
+        time.sleep(0.15)   # let the order confirmation print first
+        snap_path = _LAB_DIR / "fast_snapshot.py"
+        if not snap_path.exists():
+            return
+        spec = importlib.util.spec_from_file_location("fast_snapshot", snap_path)
+        mod  = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        mod.run(symbol)
+
+    threading.Thread(target=_run, daemon=True, name="signal-lab-snap").start()
 
 
 class Executor:
@@ -67,65 +97,61 @@ class Executor:
     def _handle_order(self, cmd: ParsedCommand):
         symbol    = cmd.symbol or self.cfg.default_symbol
         direction = cmd.direction or "LONG"
-        info      = get_symbol_info(symbol)
-        tick      = get_tick(symbol)
-        acct      = get_account()
+
+        # Single cached info lookup — shared by confirmation + dispatch
+        info = _cached_sym_info(symbol)
+        tick = get_tick(symbol)          # fresh price for display
+        acct = get_account()
 
         if info is None or tick is None:
             print(f"  ✗ Cannot get symbol info for {symbol}")
             return
 
-        # Resolve entry price
         entry = cmd.limit_price if cmd.order_type != "MARKET" else (
             tick.ask if direction == "LONG" else tick.bid
         )
 
-        # Resolve SL price
         sl_price = self._resolve_level(
             cmd.sl, cmd.sl_unit, direction, entry, info.trade_tick_size, "SL",
             self.cfg.default_sl_points,
         )
-
-        # Resolve TP price
         tp_price = self._resolve_level(
             cmd.tp, cmd.tp_unit, direction, entry, info.trade_tick_size, "TP",
             self.cfg.default_tp_points,
         )
 
-        # Lots
         lots = cmd.lots if cmd.lots is not None else self.cfg.default_lots
-        lots_capped = min(lots, self.cfg.max_lots)
-        if lots_capped < lots:
-            print(f"  ⚠ Lots capped at max {self.cfg.max_lots}")
-            lots = lots_capped
+        lots = min(lots, self.cfg.max_lots)
 
-        # Build order object
         order = TradeOrder(
-            symbol    = symbol,
-            direction = direction,
-            lots      = lots,
+            symbol      = symbol,
+            direction   = direction,
+            lots        = lots,
             order_type  = cmd.order_type,
             limit_price = cmd.limit_price if cmd.order_type != "MARKET" else None,
             stop_loss   = sl_price,
             take_profit = tp_price,
         )
 
-        self._print_order_confirmation(order, entry, acct)
+        self._print_order_confirmation(order, entry, acct, info)
 
         if not self._confirm("Execute?"):
             print("  Order skipped.")
             return
 
+        # Dispatch — pass cached info so dispatch doesn't re-query MT5
         if cmd.order_type == "MARKET":
-            ok, msg, ticket = send_market_order(order, self.cfg)
+            ok, msg, ticket = send_market_order(order, self.cfg, _info=info)
         elif cmd.order_type == "LIMIT":
-            ok, msg, ticket = send_limit_order(order, self.cfg)
+            ok, msg, ticket = send_limit_order(order, self.cfg, _info=info)
         else:
-            ok, msg, ticket = send_stop_order(order, self.cfg)
+            ok, msg, ticket = send_stop_order(order, self.cfg, _info=info)
 
         if ok:
             print(f"\n  ✓ ORDER EXECUTED  Ticket #{ticket}  {msg}")
             log.info("Order placed: ticket=%s symbol=%s dir=%s lots=%s", ticket, symbol, direction, lots)
+            # Fire signal lab snapshot in parallel — doesn't block REPL
+            _fire_signal_lab(symbol)
         else:
             print(f"\n  ✗ {msg}")
 
@@ -492,11 +518,13 @@ class Executor:
             return False
         return ans in ("y", "yes")
 
-    def _print_order_confirmation(self, order: TradeOrder, entry: float, acct):
+    def _print_order_confirmation(self, order: TradeOrder, entry: float, acct,
+                                   _info=None):
         balance  = acct.balance  if acct else 0.0
         currency = acct.currency if acct else "USD"
 
-        info    = get_symbol_info(order.symbol)
+        # Use pre-fetched info — no extra MT5 call
+        info    = _info or _cached_sym_info(order.symbol)
         tick_sz = info.trade_tick_size  if info else 0.01
         tick_v  = info.trade_tick_value if info else 1.0
 

@@ -376,11 +376,13 @@ def render_dashboard(symbol: str, rth_only: bool = False):
         console.print(build_slot_char_table(slot_df))
         console.print()
 
-        # ICT session daily
+        # ICT session daily  (all times UTC)
         ict_df = compute_ict_sessions(
             hist_df,
             rth_start_h = cfg.rth_start_h,
+            rth_start_m = cfg.rth_start_m,
             rth_end_h   = cfg.rth_end_h,
+            rth_end_m   = cfg.rth_end_m,
             n_days      = 20,
             rolling_days= 30,
         )

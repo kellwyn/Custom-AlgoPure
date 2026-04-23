@@ -121,6 +121,11 @@ def main():
 
     connect()
 
+    # Pre-cache symbol info so the first order has zero lookup overhead
+    from bot.trader import warm_symbol
+    if warm_symbol(cfg.default_symbol):
+        log.info("Symbol cache warmed: %s", cfg.default_symbol)
+
     mgr      = OrderManager(cfg)
     executor = Executor(cfg, mgr)
 

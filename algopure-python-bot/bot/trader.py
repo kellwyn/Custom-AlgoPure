@@ -1,141 +1,290 @@
 """
-Order execution + confirmation gate.
-
-Auto-execute mode  (cfg.manual_confirm = False):
-  Fires the order immediately — set only after demo validation.
-
-Manual mode        (cfg.manual_confirm = True):
-  Displays setup summary and waits for y / n / q.
+Low-level MT5 order dispatch — market, limit, stop, modify, close.
+All functions return (success: bool, message: str).
 """
+from __future__ import annotations
 
 import MetaTrader5 as mt5
+from typing import Optional, Tuple
 
-from .signals  import TradeSetup
-from .strategy import StrategyConfig
-
-
-# ── Position sizing ───────────────────────────────────────────────────────────
-
-def calc_lot_size(setup: TradeSetup, cfg: StrategyConfig) -> float:
-    """Risk-based lot sizing capped at cfg.max_lots."""
-    sym = mt5.symbol_info(setup.symbol)
-    if sym is None:
-        return 0.01
-
-    acct = mt5.account_info()
-    if acct is None:
-        return sym.volume_min
-
-    risk_amt = acct.balance * cfg.risk_pct / 100.0
-    sl_dist  = abs(setup.entry - setup.stop_loss)
-
-    if sl_dist == 0 or sym.trade_tick_size == 0 or sym.trade_tick_value == 0:
-        return sym.volume_min
-
-    val_per_pt = sym.trade_tick_value / sym.trade_tick_size
-    lot        = risk_amt / (sl_dist * val_per_pt)
-
-    max_lot = min(sym.volume_max, cfg.max_lots)
-    lot     = max(sym.volume_min, min(max_lot, lot))
-
-    if sym.volume_step > 0:
-        lot = round(round(lot / sym.volume_step) * sym.volume_step, 8)
-
-    return lot
+from .signals import TradeOrder
+from .config  import ExecutionConfig
 
 
-# ── Order execution ───────────────────────────────────────────────────────────
+# ── Symbol info helpers ───────────────────────────────────────────────────────
 
-def send_order(setup: TradeSetup, lots: float, cfg: StrategyConfig) -> bool:
-    """Send a market order to MT5. Returns True on success."""
-    tick = mt5.symbol_info_tick(setup.symbol)
+def get_symbol_info(symbol: str):
+    info = mt5.symbol_info(symbol)
+    if info is None:
+        mt5.symbol_select(symbol, True)
+        info = mt5.symbol_info(symbol)
+    return info
+
+
+def get_tick(symbol: str):
+    return mt5.symbol_info_tick(symbol)
+
+
+def pip_value_per_lot(symbol: str) -> float:
+    """Dollar P&L per 1 price unit per 1 lot."""
+    info = get_symbol_info(symbol)
+    if info is None or info.trade_tick_size == 0:
+        return 0.0
+    return info.trade_tick_value / info.trade_tick_size
+
+
+def normalize_lots(lots: float, symbol: str, max_lots: float) -> float:
+    info = get_symbol_info(symbol)
+    if info is None:
+        return round(lots, 2)
+    lo, hi, step = info.volume_min, min(info.volume_max, max_lots), info.volume_step
+    lots = max(lo, min(hi, lots))
+    if step > 0:
+        lots = round(round(lots / step) * step, 8)
+    return lots
+
+
+# ── Market order ──────────────────────────────────────────────────────────────
+
+def send_market_order(order: TradeOrder, cfg: ExecutionConfig) -> Tuple[bool, str, Optional[int]]:
+    """
+    Place a market BUY or SELL order.
+    Returns (success, message, ticket_or_None).
+    """
+    tick = get_tick(order.symbol)
     if tick is None:
-        print(f"  ERROR: no tick for {setup.symbol}")
-        return False
+        return False, f"No tick for {order.symbol}: {mt5.last_error()}", None
 
-    order_type = mt5.ORDER_TYPE_SELL if setup.direction == "SHORT" else mt5.ORDER_TYPE_BUY
-    price      = tick.bid             if setup.direction == "SHORT" else tick.ask
+    info = get_symbol_info(order.symbol)
+    if info is None:
+        return False, f"Symbol info unavailable for {order.symbol}", None
+
+    otype = mt5.ORDER_TYPE_BUY  if order.direction == "LONG" else mt5.ORDER_TYPE_SELL
+    price = tick.ask             if order.direction == "LONG" else tick.bid
+
+    lots = normalize_lots(order.lots, order.symbol, cfg.max_lots)
 
     request = {
         "action":       mt5.TRADE_ACTION_DEAL,
-        "symbol":       setup.symbol,
+        "symbol":       order.symbol,
         "volume":       lots,
-        "type":         order_type,
+        "type":         otype,
         "price":        price,
-        "sl":           setup.stop_loss,
-        "tp":           setup.target,
         "deviation":    cfg.slippage,
         "magic":        cfg.magic,
-        "comment":      "AlgoPure_v1.00",
+        "comment":      cfg.comment,
         "type_time":    mt5.ORDER_TIME_GTC,
         "type_filling": mt5.ORDER_FILLING_IOC,
     }
+    if order.stop_loss  is not None: request["sl"] = order.stop_loss
+    if order.take_profit is not None: request["tp"] = order.take_profit
 
     result = mt5.order_send(request)
+    if result is None or result.retcode != mt5.TRADE_RETCODE_DONE:
+        code    = result.retcode if result else mt5.last_error()
+        comment = result.comment if result else ""
+        return False, f"Order failed  retcode={code}  {comment}", None
 
+    return True, f"Executed @ {result.price:.5f}", result.order
+
+
+# ── Limit order ───────────────────────────────────────────────────────────────
+
+def send_limit_order(order: TradeOrder, cfg: ExecutionConfig) -> Tuple[bool, str, Optional[int]]:
+    """Place a pending LIMIT order."""
+    if order.limit_price is None:
+        return False, "Limit price required for LIMIT order", None
+
+    otype = mt5.ORDER_TYPE_BUY_LIMIT  if order.direction == "LONG" else mt5.ORDER_TYPE_SELL_LIMIT
+    lots  = normalize_lots(order.lots, order.symbol, cfg.max_lots)
+
+    request = {
+        "action":       mt5.TRADE_ACTION_PENDING,
+        "symbol":       order.symbol,
+        "volume":       lots,
+        "type":         otype,
+        "price":        order.limit_price,
+        "deviation":    cfg.slippage,
+        "magic":        cfg.magic,
+        "comment":      cfg.comment,
+        "type_time":    mt5.ORDER_TIME_GTC,
+        "type_filling": mt5.ORDER_FILLING_RETURN,
+    }
+    if order.stop_loss  is not None: request["sl"] = order.stop_loss
+    if order.take_profit is not None: request["tp"] = order.take_profit
+
+    result = mt5.order_send(request)
+    if result is None or result.retcode != mt5.TRADE_RETCODE_DONE:
+        code    = result.retcode if result else mt5.last_error()
+        comment = result.comment if result else ""
+        return False, f"Limit order failed  retcode={code}  {comment}", None
+
+    return True, f"Limit order placed @ {order.limit_price:.5f}", result.order
+
+
+# ── Stop order ────────────────────────────────────────────────────────────────
+
+def send_stop_order(order: TradeOrder, cfg: ExecutionConfig) -> Tuple[bool, str, Optional[int]]:
+    """Place a pending STOP order."""
+    if order.limit_price is None:
+        return False, "Stop price required for STOP order", None
+
+    otype = mt5.ORDER_TYPE_BUY_STOP  if order.direction == "LONG" else mt5.ORDER_TYPE_SELL_STOP
+    lots  = normalize_lots(order.lots, order.symbol, cfg.max_lots)
+
+    request = {
+        "action":       mt5.TRADE_ACTION_PENDING,
+        "symbol":       order.symbol,
+        "volume":       lots,
+        "type":         otype,
+        "price":        order.limit_price,
+        "deviation":    cfg.slippage,
+        "magic":        cfg.magic,
+        "comment":      cfg.comment,
+        "type_time":    mt5.ORDER_TIME_GTC,
+        "type_filling": mt5.ORDER_FILLING_RETURN,
+    }
+    if order.stop_loss  is not None: request["sl"] = order.stop_loss
+    if order.take_profit is not None: request["tp"] = order.take_profit
+
+    result = mt5.order_send(request)
+    if result is None or result.retcode != mt5.TRADE_RETCODE_DONE:
+        code    = result.retcode if result else mt5.last_error()
+        comment = result.comment if result else ""
+        return False, f"Stop order failed  retcode={code}  {comment}", None
+
+    return True, f"Stop order placed @ {order.limit_price:.5f}", result.order
+
+
+# ── Modify position SL / TP ───────────────────────────────────────────────────
+
+def modify_position(ticket: int, sl: Optional[float] = None,
+                    tp: Optional[float] = None) -> Tuple[bool, str]:
+    """Modify SL and/or TP on a live position by ticket."""
+    pos = _get_position(ticket)
+    if pos is None:
+        return False, f"No open position with ticket #{ticket}"
+
+    request = {
+        "action":   mt5.TRADE_ACTION_SLTP,
+        "position": ticket,
+        "symbol":   pos.symbol,
+        "sl":       sl if sl is not None else pos.sl,
+        "tp":       tp if tp is not None else pos.tp,
+    }
+    result = mt5.order_send(request)
+    if result is None or result.retcode != mt5.TRADE_RETCODE_DONE:
+        code    = result.retcode if result else mt5.last_error()
+        comment = result.comment if result else ""
+        return False, f"Modify failed  retcode={code}  {comment}"
+
+    parts = []
+    if sl is not None: parts.append(f"SL → {sl:.5f}")
+    if tp is not None: parts.append(f"TP → {tp:.5f}")
+    return True, "  ".join(parts)
+
+
+def modify_pending_order(ticket: int, price: Optional[float] = None,
+                         sl: Optional[float] = None,
+                         tp: Optional[float] = None) -> Tuple[bool, str]:
+    """Modify a pending limit/stop order."""
+    orders = mt5.orders_get(ticket=ticket)
+    if not orders:
+        return False, f"No pending order with ticket #{ticket}"
+    o = orders[0]
+    request = {
+        "action":  mt5.TRADE_ACTION_MODIFY,
+        "order":   ticket,
+        "price":   price if price is not None else o.price_open,
+        "sl":      sl    if sl    is not None else o.sl,
+        "tp":      tp    if tp    is not None else o.tp,
+        "type_time":    mt5.ORDER_TIME_GTC,
+        "type_filling": mt5.ORDER_FILLING_RETURN,
+    }
+    result = mt5.order_send(request)
     if result is None or result.retcode != mt5.TRADE_RETCODE_DONE:
         code = result.retcode if result else mt5.last_error()
+        return False, f"Modify pending failed  retcode={code}"
+    return True, f"Pending order #{ticket} modified"
+
+
+# ── Close position ────────────────────────────────────────────────────────────
+
+def close_position(ticket: int, cfg: ExecutionConfig) -> Tuple[bool, str]:
+    """Close a live position by ticket (full close)."""
+    pos = _get_position(ticket)
+    if pos is None:
+        return False, f"No open position with ticket #{ticket}"
+
+    tick = get_tick(pos.symbol)
+    if tick is None:
+        return False, f"No tick for {pos.symbol}"
+
+    close_type  = mt5.ORDER_TYPE_SELL if pos.type == mt5.ORDER_TYPE_BUY else mt5.ORDER_TYPE_BUY
+    close_price = tick.bid             if pos.type == mt5.ORDER_TYPE_BUY else tick.ask
+
+    request = {
+        "action":       mt5.TRADE_ACTION_DEAL,
+        "position":     ticket,
+        "symbol":       pos.symbol,
+        "volume":       pos.volume,
+        "type":         close_type,
+        "price":        close_price,
+        "deviation":    cfg.slippage,
+        "magic":        cfg.magic,
+        "comment":      f"close {cfg.comment}",
+        "type_time":    mt5.ORDER_TIME_GTC,
+        "type_filling": mt5.ORDER_FILLING_IOC,
+    }
+    result = mt5.order_send(request)
+    if result is None or result.retcode != mt5.TRADE_RETCODE_DONE:
+        code    = result.retcode if result else mt5.last_error()
         comment = result.comment if result else ""
-        print(f"  ORDER FAILED  retcode={code}  {comment}")
-        return False
+        return False, f"Close failed  retcode={code}  {comment}"
 
-    sep = "=" * 60
-    print(f"\n{sep}")
-    print(f"  ORDER EXECUTED")
-    print(f"  Ticket    : #{result.order}")
-    print(f"  Symbol    : {setup.symbol}  [{setup.timeframe}]")
-    print(f"  Direction : {setup.direction}")
-    print(f"  Volume    : {lots} lots")
-    print(f"  Price     : {result.price:.5f}")
-    print(f"  Stop Loss : {setup.stop_loss:.5f}")
-    print(f"  Target    : {setup.target:.5f}")
-    print(f"  R:R       : 1:{setup.risk_reward:.2f}")
-    print(sep)
-    return True
+    direction = "LONG" if pos.type == mt5.ORDER_TYPE_BUY else "SHORT"
+    profit    = pos.profit
+    pnl_str   = f"+${profit:,.2f}" if profit >= 0 else f"-${abs(profit):,.2f}"
+    return True, f"#{ticket} {pos.symbol} {direction} {pos.volume} lots  P&L: {pnl_str}"
 
 
-# ── Confirmation + execution gate ─────────────────────────────────────────────
+def close_all_positions(cfg: ExecutionConfig, symbol: Optional[str] = None) -> list[str]:
+    """Close all open positions, optionally filtered by symbol."""
+    positions = mt5.positions_get(symbol=symbol) if symbol else mt5.positions_get()
+    if not positions:
+        return ["No open positions to close."]
+    results = []
+    for pos in positions:
+        ok, msg = close_position(pos.ticket, cfg)
+        tag = "✓" if ok else "✗"
+        results.append(f"  {tag} {msg}")
+    return results
 
-def execute_setup(setup: TradeSetup, cfg: StrategyConfig):
-    """Auto-execute or present manual confirmation, then send the order."""
-    lots     = calc_lot_size(setup, cfg)
-    acct     = mt5.account_info()
-    balance  = acct.balance  if acct else 0.0
-    currency = acct.currency if acct else ""
-    risk_usd = balance * cfg.risk_pct / 100.0
 
-    sep = "=" * 60
-    print(f"\n{sep}")
-    print(f"  AlgoPure v1.00 — {setup.direction} signal")
-    print(f"  Symbol    : {setup.symbol}  [{setup.timeframe}]")
-    print(f"  Entry     : {setup.entry:.5f}")
-    print(f"  Stop Loss : {setup.stop_loss:.5f}")
-    print(f"  Target    : {setup.target:.5f}")
-    print(f"  R:R       : 1:{setup.risk_reward:.2f}")
-    print(f"  Lots      : {lots:.2f}  (risk {cfg.risk_pct}% = {risk_usd:.2f} {currency})")
-    print(sep)
+def cancel_pending_order(ticket: int) -> Tuple[bool, str]:
+    """Cancel a pending limit/stop order."""
+    request = {"action": mt5.TRADE_ACTION_REMOVE, "order": ticket}
+    result  = mt5.order_send(request)
+    if result is None or result.retcode != mt5.TRADE_RETCODE_DONE:
+        code = result.retcode if result else mt5.last_error()
+        return False, f"Cancel failed  retcode={code}"
+    return True, f"Pending order #{ticket} cancelled"
 
-    if not cfg.manual_confirm:
-        print("  [AUTO] Executing order...")
-        send_order(setup, lots, cfg)
-        return
 
-    print("  [MANUAL] Confirm trade execution:")
-    while True:
-        try:
-            ans = input("  Execute?  [y = yes / n = skip / q = quit]: ").strip().lower()
-        except (EOFError, KeyboardInterrupt):
-            print("\n  Cancelled.")
-            return
+# ── Helpers ───────────────────────────────────────────────────────────────────
 
-        if ans == "y":
-            send_order(setup, lots, cfg)
-            break
-        elif ans == "n":
-            print("  Setup skipped.")
-            break
-        elif ans == "q":
-            print("  Shutting down.")
-            raise SystemExit(0)
-        else:
-            print("  Enter  y  n  or  q")
+def _get_position(ticket: int):
+    positions = mt5.positions_get(ticket=ticket)
+    return positions[0] if positions else None
+
+
+def get_open_positions(symbol: Optional[str] = None):
+    return mt5.positions_get(symbol=symbol) or []
+
+
+def get_pending_orders(symbol: Optional[str] = None):
+    return mt5.orders_get(symbol=symbol) or []
+
+
+def get_account() -> Optional[object]:
+    return mt5.account_info()
